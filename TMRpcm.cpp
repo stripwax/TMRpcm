@@ -153,7 +153,7 @@
 #if defined (ENABLE_MULTI)
     volatile byte buffer2[2][buffSize];
     volatile byte buffCount2 = 0;
-    volatile boolean buffEmpty2[2] = {false,false}, whichBuff2 = false, playing2 = 0;
+    volatile boolean buffWaiting2[2] = {true,true}, whichBuff2 = false, playing2 = 0;
 
     char volMod2=0;
     char *fileName2;
@@ -166,7 +166,7 @@
 
 //*********** Standard Global Variables ***************
 volatile unsigned int dataEnd;
-volatile boolean buffEmpty[2] = {true,true}, whichBuff = false, playing = 0, a, b;
+volatile boolean buffWaiting[2] = {true,true}, whichBuff = false, playing = 0, a, b;
 
 //*** Options/Indicators from MSb to LSb: paused, qual, rampUp, 2-byte samples, loop, loop2nd track, 16-bit ***
 byte optionByte = B01100000;
@@ -380,6 +380,9 @@ void TMRpcm::stopPlayback(){
 
     if(ifOpen()){ sFile.close(); }
 
+    // mark buffers as empty
+    buffWaiting[0] = buffWaiting[1] = true;
+
     #if defined (ENABLE_MULTI)
         playing2 = 0;
         #if !defined (SDFAT)
@@ -387,6 +390,10 @@ void TMRpcm::stopPlayback(){
         #else
         if(tFile.isOpen()){tFile.close();}
         #endif
+
+        // mark buffers as empty
+        buffWaiting2[0] = buffWaiting2[1] = true;
+
     #endif
 
 }
@@ -394,13 +401,11 @@ void TMRpcm::stopPlayback(){
 void TMRpcm::pause(){
     //paused = !paused;
     if(bitRead(optionByte,7) && playing){
+        //paused -> unpaused
         bitClear(optionByte,7);
-        #if !defined (USE_TIMER2)
-            *TIMSK[tt] |= ( _BV(ICIE1) | _BV(TOIE1) );
-        #else
-            *TIMSK[tt] |= ( _BV(OCIE2B) | _BV(TOIE1) );
-        #endif
+        *TIMSK[tt] |= ( togByte | _BV(TOIE1) );
     }else if(!bitRead(optionByte,7) && playing){
+        //unpaused -> paused
         bitSet(optionByte,7);
         *TIMSK[tt] &= ~( _BV(TOIE1) );
     }
@@ -550,7 +555,7 @@ void TMRpcm::play(char* filename, unsigned long seekPoint){
         for(unsigned int i=0; i<buffSize; i++){ mod = constrain(mod-1,tmp, mod); buffer[1][i] = mod; }
     }
 
-    whichBuff = 0; buffEmpty[0] = 0; buffEmpty[1] = 0; buffCount = 0;
+    whichBuff = 0; buffWaiting[0] = 1; buffWaiting[1] = 1; buffCount = 0;
     noInterrupts();
     timerSt();
 
@@ -574,14 +579,13 @@ void TMRpcm::setVolume(char vol) {
 }
 
 #if defined (ENABLE_RECORDING)
-
-  ISR(TIMER1_COMPA_vect){
-        if(buffEmpty[!whichBuff] == 0){
+    ISR(TIMER1_COMPA_vect){
+        if(buffWaiting[!whichBuff]){
             a = !whichBuff;
             *TIMSK[tt] &= ~(_BV(OCIE1A));
             sei();
             sFile.write((byte*)buffer[a], buffSize );
-            buffEmpty[a] = 1;
+            buffWaiting[a] = 0;
             *TIMSK[tt] |= _BV(OCIE1A);
         }
   }
@@ -592,15 +596,13 @@ ISR(TIMER1_CAPT_vect){
 #else                     //Using TIMER2
 ISR(TIMER2_COMPB_vect){
 #endif
+    // This is the lower priority ISR, which can be interrupted by a higher-priority ISR
+    // The first step is to disable this interrupt before manually enabling global interrupts.
+    // This allows this interrupt vector to continue loading data while allowing the other interrupt
+    // to interrupt it. ( Nested Interrupts )
+    // Then enable global interupts before this interrupt is finished, so the music can interrupt the buffering
 
-  // The first step is to disable this interrupt before manually enabling global interrupts.
-  // This allows this interrupt vector (COMPB) to continue loading data while allowing the overflow interrupt
-  // to interrupt it. ( Nested Interrupts )
-  // TIMSK1 &= ~_BV(ICIE1);
- //Then enable global interupts before this interrupt is finished, so the music can interrupt the buffering
-  //sei();
-
-    if(buffEmpty[!whichBuff]){
+    if(buffWaiting[!whichBuff]){
 
         a = !whichBuff;
         *TIMSK[tt] &= ~togByte;
@@ -621,8 +623,8 @@ ISR(TIMER2_COMPB_vect){
             return;
         }
         sFile.read((byte*)buffer[a],buffSize);
-            buffEmpty[a] = 0;
-            *TIMSK[tt] |= togByte;
+        buffWaiting[a] = 0;
+        *TIMSK[tt] |= togByte;
     }
 }
 
@@ -643,9 +645,9 @@ ISR(TIMER2_COMPB_vect){
         }else{            *OCRnB[tt] = buffer[whichBuff][buffCount] << volMod;
         }
         ++buffCount;
-          if(buffCount >= buffSize){
+        if(buffCount >= buffSize){
           buffCount = 0;
-          buffEmpty[whichBuff] = true;
+          buffWaiting[whichBuff] = true;
           whichBuff = !whichBuff;
         }
     }
@@ -661,12 +663,12 @@ ISR(TIMER2_COMPB_vect){
         }else{            *OCRnA[tt] = ADCH << volMod;
         }
     }
-        buffCount++;
-        if(buffCount >= buffSize){
-            buffEmpty[whichBuff] = 0;
-            buffCount = 0;
-            whichBuff = !whichBuff;
-        }
+    ++buffCount;
+    if(buffCount >= buffSize){
+        buffCount = 0;
+        buffWaiting[whichBuff] = true;
+        whichBuff = !whichBuff;
+    }
   }
 
 #endif
@@ -713,7 +715,7 @@ ISR(TIMER1_OVF_vect){
 
     if(buffCount >= buffSize){
       buffCount = 0;
-      buffEmpty[whichBuff] = true;
+      buffWaiting[whichBuff] = true;
       whichBuff = !whichBuff;
     }
 }
@@ -793,7 +795,7 @@ void TMRpcm::play(char* filename, unsigned long seekPoint, boolean which){
   }
   byte dual = 0;
 
-    #if defined(rampMega)
+#if defined(rampMega)
     if(bitRead(optionByte,5)){//RampUp
         *OCRnA[tt] = 0; *OCRnB[tt] = resolution;
         #if defined (MODE2)
@@ -811,25 +813,27 @@ void TMRpcm::play(char* filename, unsigned long seekPoint, boolean which){
 
         }
     }
-    #endif
+#endif
 
-  if((!playing && !playing2) || (playing && !playing2 && !which) || (playing2 && !playing && which) ){
-      stopPlayback();
-      if(!wavInfo(filename) ){ return; }//verify its a valid wav file
-      if(seekPoint > 0){ seekPoint = SAMPLE_RATE*seekPoint;}
-      if(!which){
+    if((!playing && !playing2) || (playing && !playing2 && !which) || (playing2 && !playing && which) ){
+        // only one wav is playing, and we're replacing that one with a different one
+        stopPlayback();
+        if(!wavInfo(filename) ){ return; }//verify its a valid wav file
+        if(seekPoint > 0){ seekPoint = SAMPLE_RATE*seekPoint;}
+        if(!which){
         #if !defined (SDFAT)
-        sFile = SD.open(filename);
-        #else
-        sFile.open(filename,O_READ);
-        #endif
-      }else{
-          #if !defined (SDFAT)
+            sFile = SD.open(filename);
+            #else
+            sFile.open(filename,O_READ);
+            #endif
+        }else{
+            #if !defined (SDFAT)
             tFile = SD.open(filename);
-          #else
+            #else
             tFile.open(filename,O_READ);
-          #endif
-      }
+            #endif
+        }
+
         if(SAMPLE_RATE > 45050 ){ SAMPLE_RATE = 24000;
             #if defined (debug)
                 Serial.print("SampleRate Too High");
@@ -842,56 +846,53 @@ void TMRpcm::play(char* filename, unsigned long seekPoint, boolean which){
         resolution = 255;
     #endif
 
+    } else {
+        if(!which){ playing = 0; sFile.close(); dual = 1; }
+        if(which ){ playing2 = 0; tFile.close(); dual = 1; }
+    }
 
-  }else{
-      if(!which){ playing = 0; sFile.close(); dual = 1; }
-      if(which ){ playing2 = 0; tFile.close(); dual = 1; }
-  }
-
- if(!dual){
-
-    if(!which){
-        //paused = 0;
-        bitClear(optionByte,7);
-        if(ifOpen()){
-            if(seekPoint > 0){ seek(seekPoint); }else{ seek(44); }
-            ramp(0);
-            playing = 1;
-        }else{
-            #if defined (debug)
-                Serial.println("Read fail");
-            #endif
-            return;
-        }
-    }else{
-        //paused = 0;
-        bitClear(optionByte,7);
-        #if !defined (SDFAT)
-            if(tFile){
-                if(seekPoint > 0){ tFile.seek(seekPoint); }else{ tFile.seek(44); }
-        #else
-            if(tFile.isOpen()){
-                tFile.seekSet(seekPoint);
-                if(seekPoint > 0){ tFile.seekSet(seekPoint); }else{ tFile.seekSet(44); }
-        #endif
-                ramp(1);
-                playing2 = 2;
+    if(!dual){
+        if(!which){
+            //paused = 0;
+            bitClear(optionByte,7);
+            if(ifOpen()){
+                if(seekPoint > 0){ seek(seekPoint); }else{ seek(44); }
+                ramp(0);
+                playing = 1;
             }else{
                 #if defined (debug)
                     Serial.println("Read fail");
                 #endif
                 return;
             }
+        }else{
+            //paused = 0;
+            bitClear(optionByte,7);
+            #if !defined (SDFAT)
+                if(tFile){
+                    if(seekPoint > 0){ tFile.seek(seekPoint); }else{ tFile.seek(44); }
+            #else
+                if(tFile.isOpen()){
+                    tFile.seekSet(seekPoint);
+                    if(seekPoint > 0){ tFile.seekSet(seekPoint); }else{ tFile.seekSet(44); }
+            #endif
+                    ramp(1);
+                    playing2 = 1;
+                } else {
+                    #if defined (debug)
+                        Serial.println("Read fail");
+                    #endif
+                    return;
+                }
+        }
+
+        noInterrupts();
+        timerSt();
+        *TIMSK[tt] = ( togByte | _BV(TOIE1) );
+        interrupts();
     }
-
-    noInterrupts();
-    timerSt();
-    *TIMSK[tt] = ( togByte | _BV(TOIE1) );
-    interrupts();
-
-  }
-
-  if(dual){
+    else
+    {
         if(seekPoint > 0){ seekPoint = SAMPLE_RATE*seekPoint;}
         *TIMSK[tt] &= ~togByte;
         if(!which){
@@ -905,15 +906,16 @@ void TMRpcm::play(char* filename, unsigned long seekPoint, boolean which){
             if(ifOpen()){
                 if(seekPoint > 0){ seek(seekPoint); }else{ seek(44); }
                 ramp(0); playing = 1;
-            }else{
+            } else {
                 #if defined (debug)
                 Serial.println("Dual Read fail");
                 #endif
                 return;
             }//open1 = 1; fileName2 = filename;  }
-         }else
-
-         if(which){
+        }
+        else
+        {
+            if(which){
             #if !defined (SDFAT)
                 if(tFile){tFile.close();}
                 tFile = SD.open(filename);
@@ -923,21 +925,21 @@ void TMRpcm::play(char* filename, unsigned long seekPoint, boolean which){
             #else
                 if(tFile.isOpen()){tFile.close();}
                 tFile.open(filename);
-                if(tFile.isOpen()){
+                if(tFile.isOpen()) {
                     if(seekPoint > 0){ tFile.seekSet(seekPoint); }else{ tFile.seekSet(44); }
 
             #endif
                     ramp(1); playing2 = 1;
-                }else{
+                } else {
                     #if defined (debug)
-                        Serial.println("Dual Read fail");
+                    Serial.println("Dual Read fail");
                     #endif
                 return;
-                } //open1 = 1; fileName2 = filename;  }
-         }
-         *TIMSK[tt] |= togByte;
+            } //open1 = 1; fileName2 = filename;  }
+        }
+        *TIMSK[tt] |= togByte;
         //interrupts();
-  }
+    }
 }
 
 void TMRpcm::ramp(boolean wBuff){
@@ -957,7 +959,7 @@ void TMRpcm::ramp(boolean wBuff){
         }else{
             for(byte i=0; i<buffSize; i++){ mod = constrain(mod-1,tmp ,mod); buffer[0][i] = mod; }
         }
-        whichBuff = 0; buffEmpty[0] = 0;buffCount = 0; //buffEmpty[1] = 0;
+        whichBuff = 0; buffWaiting[0] = 0;buffCount = 0; //buffWaiting[1] = 0;
       }else{
           //#if !defined (SDFAT)
           //tFile.seek(44);
@@ -972,7 +974,7 @@ void TMRpcm::ramp(boolean wBuff){
         }else{
             for(byte i=0; i<buffSize; i++){ mod = constrain(mod-1,tmp ,mod); buffer2[0][i] = mod; }
         }
-        whichBuff2 = 0; buffEmpty2[0] = 0; buffCount2 = 0; //buffEmpty2[1] = 0;
+        whichBuff2 = 0; buffWaiting2[0] = 0; buffCount2 = 0; //buffWaiting2[1] = 0;
      }
     #else //MODE2
       if(!wBuff){
@@ -986,7 +988,7 @@ void TMRpcm::ramp(boolean wBuff){
             for(byte i=0; i<buffSize; i++){ mod = constrain(mod-1,tmp ,mod); buffer[0][i] = mod; }
             for(byte i=0; i<buffSize; i++){ mod = constrain(mod-1,tmp ,mod); buffer[1][i] = mod; }
         }
-        whichBuff = 0; buffEmpty[0] = 0;buffCount = 0; //buffEmpty[1] = 0;
+        whichBuff = 0; buffWaiting[0] = 0;buffCount = 0; //buffWaiting[1] = 0;
       }else{
           //#if !defined (SDFAT)
           //tFile.seek(44);
@@ -1003,7 +1005,7 @@ void TMRpcm::ramp(boolean wBuff){
             for(byte i=0; i<buffSize; i++){ mod = constrain(mod-1,tmp ,mod); buffer2[0][i] = mod; }
             for(byte i=0; i<buffSize; i++){ mod = constrain(mod-1,tmp ,mod); buffer2[1][i] = mod; }
         }
-        whichBuff2 = 0; buffEmpty2[0] = 0; buffCount2 = 0; //buffEmpty2[1] = 0;
+        whichBuff2 = 0; buffWaiting2[0] = 0; buffCount2 = 0; //buffWaiting2[1] = 0;
      }
 
     #endif
@@ -1047,11 +1049,11 @@ ISR(TIMER2_COMPB_vect){
     //if(playing || playing2){
 
     b = !whichBuff2; a = !whichBuff;
-    if(buffEmpty[a] || buffEmpty2[b]){
+    if(buffWaiting[a] || buffWaiting2[b]){
         *TIMSK[tt] &= ~togByte;
         sei();
 
-        if(buffEmpty[a] ){
+        if(buffWaiting[a] ){
 
             if(sFile.read((byte*)buffer[a],buffSize) < buffSize){
 
@@ -1064,11 +1066,11 @@ ISR(TIMER2_COMPB_vect){
                 #endif
                 playing = 0;
             }
-            buffEmpty[a] = 0;
+            buffWaiting[a] = 0;
 
         }
 
-        if(buffEmpty2[b] ){
+        if(buffWaiting2[b] ){
             if(tFile.read((byte*)buffer2[b],buffSize) < buffSize){
 
                 #if !defined (SDFAT)
@@ -1080,12 +1082,12 @@ ISR(TIMER2_COMPB_vect){
                 #endif
                 playing2 = 0;
             }
-            buffEmpty2[b] = 0;
+            buffWaiting2[b] = 0;
 
         }
-    if(!playing && !playing2){  *TIMSK[tt] &= ~( togByte | _BV(TOIE1) );}
-    else{   *TIMSK[tt] |= togByte;  }
-}
+        if(!playing && !playing2){  *TIMSK[tt] &= ~( togByte | _BV(TOIE1) );}
+        else{   *TIMSK[tt] |= togByte;  }
+    }
 }
 
 
@@ -1122,9 +1124,9 @@ ISR(TIMER2_OVF_vect){
         }
         buffCount++;
         if(buffCount >= buffSize){
-        buffCount = 0;
-        buffEmpty[whichBuff] = true;
-        whichBuff = !whichBuff;
+            buffCount = 0;
+            buffWaiting[whichBuff] = true;
+            whichBuff = !whichBuff;
         }
       }else{//STEREO
 
@@ -1148,9 +1150,9 @@ ISR(TIMER2_OVF_vect){
         }
         buffCount+=2;
         if(buffCount >= buffSize){
-        buffCount = 0;
-        buffEmpty[whichBuff] = true;
-        whichBuff = !whichBuff;
+            buffCount = 0;
+            buffWaiting[whichBuff] = true;
+            whichBuff = !whichBuff;
         }
       }
 
@@ -1173,12 +1175,12 @@ ISR(TIMER2_OVF_vect){
                 *OCRnA[tt2] = *OCRnB[tt2] = buffer2[whichBuff2][buffCount2] << volMod;
                 #endif
             }
-              buffCount2++;
-              if(buffCount2 >= buffSize){
+            buffCount2++;
+            if(buffCount2 >= buffSize){
                 buffCount2 = 0;
-                buffEmpty2[whichBuff2] = true;
+                buffWaiting2[whichBuff2] = true;
                 whichBuff2 = !whichBuff2;
-              }
+            }
 
 
         }else{
@@ -1199,12 +1201,12 @@ ISR(TIMER2_OVF_vect){
                 *OCRnB[tt2] = buffer2[whichBuff2][buffCount2+1] << volMod;
                 #endif
             }
-              buffCount2 += 2;
-                  if(buffCount2 >= buffSize){
+            buffCount2 += 2;
+            if(buffCount2 >= buffSize){
                 buffCount2 = 0;
-                buffEmpty2[whichBuff2] = true;
+                buffWaiting2[whichBuff2] = true;
                 whichBuff2 = !whichBuff2;
-              }
+            }
 
 
         }
@@ -1698,6 +1700,10 @@ void TMRpcm::startRecording(const __FlashStringHelper* FS, unsigned int sampleRa
 
 void TMRpcm::startRecording(char *fileName, unsigned int SAMPLE_RATE, byte pin, byte passThrough){
 
+    #if defined(USE_TIMER2)
+    #error Timer2 not yet supported for recording
+    #endif
+
     recording = passThrough + 1;
     setPin();
     if(recording < 3){
@@ -1725,7 +1731,8 @@ void TMRpcm::startRecording(char *fileName, unsigned int SAMPLE_RATE, byte pin, 
       #endif
     seek(44);
     }
-    buffCount = 0; buffEmpty[0] = 1; buffEmpty[1] = 1;
+
+    buffCount = 0; buffWaiting[0] = 0; buffWaiting[1] = 0;
 
 
     /*** This section taken from wiring_analog.c to translate between pins and channel numbers ***/
@@ -1806,6 +1813,9 @@ void TMRpcm::stopRecording(char *fileName){
         sFile.close();
         finalizeWavTemplate(fileName);
     }
+
+    // mark buffers as empty
+    buffWaiting[0] = 0; buffWaiting[1] = 0;
 }
 
 
