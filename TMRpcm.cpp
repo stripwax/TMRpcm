@@ -663,8 +663,8 @@ ISR(TIMER2_COMPB_vect){
     }
         buffCount++;
         if(buffCount >= buffSize){
+            buffEmpty[whichBuff] = 0;
             buffCount = 0;
-            buffEmpty[!whichBuff] = 0;
             whichBuff = !whichBuff;
         }
   }
