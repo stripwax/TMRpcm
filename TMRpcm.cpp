@@ -17,7 +17,14 @@
 
 #if !defined (USE_TIMER2) //NOT using TIMER2
 
-    const byte togByte = _BV(ICIE1); //Get the value for toggling the buffer interrupt on/off
+    // Use OVF (overflow) for low-priority ISR - read/write buffers to/from SD
+    // Use CAPT (capture) for high-priority ISR - take one sample from buffer or write one sample to buffer
+    // Per datasheet, CAPT is higher priority than OVF so if both were to occur simultaneously, we give
+    // preference to samples.  Also, neither CAPT nor OVF depend on any PWM parameters, ensuring consistency
+    // of sample timing.
+
+    const byte SD_ISR_IE = _BV(TOIE1); //Get the value for toggling the buffer interrupt on/off
+    const byte SAMPLE_ISR_IE = _BV(ICIE1); //Get the value for toggling the buffer interrupt on/off
 
     #if defined(__AVR_ATmega1280__) || defined(__AVR_ATmega2560__)
 
@@ -142,7 +149,8 @@
         volatile byte *OCRnB[] = {&OCR2B};
         volatile byte *TCNT[] = {&TCNT2};
 
-        const byte togByte = _BV(OCIE2B);
+        const byte SD_ISR_IE = _BV(TOIE1); // OVF is lower priority than Compare B
+        const byte SAMPLE_ISR_IE = _BV(OCIE2B); // Compare B is higher priority than OVF
 
 
 #endif
@@ -376,7 +384,7 @@ void TMRpcm::quality(boolean q){
 void TMRpcm::stopPlayback(){
     playing = 0;
 
-    *TIMSK[tt] &= ~(togByte | _BV(TOIE1));
+    *TIMSK[tt] &= ~(SD_ISR_IE | SAMPLE_ISR_IE);
 
     if(ifOpen()){ sFile.close(); }
 
@@ -401,13 +409,15 @@ void TMRpcm::stopPlayback(){
 void TMRpcm::pause(){
     //paused = !paused;
     if(bitRead(optionByte,7) && playing){
-        //paused -> unpaused
+        //paused -> unpaused .  re-enable both interrupts
         bitClear(optionByte,7);
-        *TIMSK[tt] |= ( togByte | _BV(TOIE1) );
+        *TIMSK[tt] |= ( SD_ISR_IE | SAMPLE_ISR_IE );
     }else if(!bitRead(optionByte,7) && playing){
-        //unpaused -> paused
+        //unpaused -> paused .  disable the sample interrupt
+        //can keep the buffer interrupt enabled since we can still fill
+        //any other buffer(s) that need filling
         bitSet(optionByte,7);
-        *TIMSK[tt] &= ~( _BV(TOIE1) );
+        *TIMSK[tt] &= ~( SAMPLE_ISR_IE );
     }
 }
 
@@ -559,7 +569,7 @@ void TMRpcm::play(char* filename, unsigned long seekPoint){
     noInterrupts();
     timerSt();
 
-    *TIMSK[tt] = ( togByte | _BV(TOIE1) );
+    *TIMSK[tt] = ( SD_ISR_IE | SAMPLE_ISR_IE );
 
     interrupts();
 
@@ -578,23 +588,10 @@ void TMRpcm::setVolume(char vol) {
     volMod = vol - 4 ;
 }
 
-#if defined (ENABLE_RECORDING)
-    ISR(TIMER1_COMPA_vect){
-        if(buffWaiting[!whichBuff]){
-            a = !whichBuff;
-            *TIMSK[tt] &= ~(_BV(OCIE1A));
-            sei();
-            sFile.write((byte*)buffer[a], buffSize );
-            buffWaiting[a] = 0;
-            *TIMSK[tt] |= _BV(OCIE1A);
-        }
-  }
-#endif
-
 #if !defined (USE_TIMER2) //Not using TIMER2
-ISR(TIMER1_CAPT_vect){
+ISR(TIMER1_OVF_vect){
 #else                     //Using TIMER2
-ISR(TIMER2_COMPB_vect){
+ISR(TIMER2_OVF_vect){
 #endif
     // This is the lower priority ISR, which can be interrupted by a higher-priority ISR
     // The first step is to disable this interrupt before manually enabling global interrupts.
@@ -602,35 +599,63 @@ ISR(TIMER2_COMPB_vect){
     // to interrupt it. ( Nested Interrupts )
     // Then enable global interupts before this interrupt is finished, so the music can interrupt the buffering
 
+    // This ISR serves a dual purpose: read from SD (when playing) to fill playback buffers, or write to
+    // SD (when recording) to dump the filled record buffers to sd
+
     if(buffWaiting[!whichBuff]){
 
         a = !whichBuff;
-        *TIMSK[tt] &= ~togByte;
+        *TIMSK[tt] &= ~(SD_ISR_IE);
         sei();
 
-        if( sFile.available() <= dataEnd){
-
-            #if !defined (SDFAT)
-                if(bitRead(optionByte,3)){ sFile.seek(44); *TIMSK[tt] |= togByte; return;}
-                *TIMSK[tt] &= ~( togByte | _BV(TOIE1) );
-                if(sFile){ sFile.close();}
-            #else
-                if(bitRead(optionByte,3)){ sFile.seekSet(44); *TIMSK[tt] |= togByte; return;}
-                *TIMSK[tt] &= ~( togByte | _BV(TOIE1) );
-                if(sFile.isOpen()){ sFile.close();}
-            #endif
-            playing = 0;
-            return;
+        #if defined (ENABLE_RECORDING)
+        if(recording) {
+            sFile.write((byte*)buffer[a], buffSize );
         }
-        sFile.read((byte*)buffer[a],buffSize);
+        else
+        {
+        #endif
+
+            if( sFile.available() <= dataEnd){
+                // bug here: should completely drain the file, this is missing the last chunk.
+                // Playback should only end when sFile.available() == 0
+
+                if(bitRead(optionByte,3)){
+                    // restart from beginning (looping)
+                #if !defined (SDFAT)
+                    sFile.seek(44);
+                #else
+                    sFile.seekSet(44);
+                #endif
+                    *TIMSK[tt] |= SD_ISR_IE;
+                }
+                else{
+                    // no looping
+                    *TIMSK[tt] &= ~( SD_ISR_IE | SAMPLE_ISR_IE );
+                #if !defined (SDFAT)
+                    if(sFile){ sFile.close();}
+                #else
+                    if(sFile.isOpen()){ sFile.close();}
+                #endif
+                }
+                return;
+            }
+            sFile.read((byte*)buffer[a],buffSize);
+
+        #if defined (ENABLE_RECORDING)
+        }
+        #endif
+
         buffWaiting[a] = 0;
-        *TIMSK[tt] |= togByte;
+        *TIMSK[tt] |= SD_ISR_IE;
     }
 }
 
 #if defined(USE_TIMER2)
 
-    ISR(TIMER2_OVF_vect){
+    ISR(TIMER2_COMPB_vect){
+        // This is the higher-priority ISR
+        // Servicing this is more important than SD operations
 
         //TIMER2 runs at 16mhz/255 (62,745Hz), so the timing for sample rate must be manually counted
         switch (SR){
@@ -654,64 +679,63 @@ ISR(TIMER2_COMPB_vect){
 
 #else
 
+ISR(TIMER1_CAPT_vect){
+    // This is the higher-priority ISR
+    // Servicing this is more important than SD operations
+
 #if defined (ENABLE_RECORDING)
-  ISR(TIMER1_COMPB_vect){
-
-    buffer[whichBuff][buffCount] = ADCH;
-    if(recording > 1){
-        if(volMod < 0 ){  *OCRnA[tt] = ADCH >> (volMod*-1);
-        }else{            *OCRnA[tt] = ADCH << volMod;
-        }
-    }
-    ++buffCount;
-    if(buffCount >= buffSize){
-        buffCount = 0;
-        buffWaiting[whichBuff] = true;
-        whichBuff = !whichBuff;
-    }
-  }
-
-#endif
-
-ISR(TIMER1_OVF_vect){
-
-
-    if(bitRead(optionByte,6)){loadCounter = !loadCounter;if(loadCounter){ return; } }
-
-    #if defined (STEREO_OR_16BIT)
-    if( !bitRead(optionByte,4) ){
-    #endif
-        if(volMod < 0 ){  *OCRnA[tt] = *OCRnB[tt] = buffer[whichBuff][buffCount] >> (volMod*-1);
-        }else{            *OCRnA[tt] = *OCRnB[tt] = buffer[whichBuff][buffCount] << volMod;
+    if(recording) {
+        buffer[whichBuff][buffCount] = ADCH;
+        if(recording > 1){
+            if(volMod < 0 ){  *OCRnA[tt] = ADCH >> (volMod*-1);
+            }else{            *OCRnA[tt] = ADCH << volMod;
+            }
         }
         ++buffCount;
-
-    #if defined (STEREO_OR_16BIT)
-    }else{
-        if(bitRead(optionByte,1)){
-            buffer[whichBuff][buffCount] += 127;
-            //buffer[whichBuff][buffCount+1] += 127;
-        }
-        #if !defined (MODE2)
-            if(volMod < 0 ){ *OCRnA[tt] = buffer[whichBuff][buffCount] >> (volMod*-1);
-                             *OCRnB[tt] = buffer[whichBuff][buffCount+1] >> (volMod*-1);
-
-            }else{           *OCRnA[tt] = buffer[whichBuff][buffCount] << volMod;
-                             *OCRnB[tt] = buffer[whichBuff][buffCount+1] << volMod;
-            }
-        #else
-            if(volMod < 0 ){
-                             *OCRnA[tt] = *OCRnB[tt] = buffer[whichBuff][buffCount] >> (volMod*-1);
-                             *OCRnA[tt2] = *OCRnB[tt2] =buffer[whichBuff][buffCount+1] >> (volMod*-1);
-
-            }else{           *OCRnA[tt] = *OCRnB[tt] = buffer[whichBuff][buffCount] << volMod;
-                             *OCRnA[tt2] = *OCRnB[tt2] = buffer[whichBuff][buffCount+1] << volMod;
-            }
-
-        #endif
-        buffCount+=2;
     }
-    #endif
+    else
+    {
+#endif
+        if(bitRead(optionByte,6)){loadCounter = !loadCounter;if(loadCounter){ return; } }
+
+        #if defined (STEREO_OR_16BIT)
+        if( !bitRead(optionByte,4) ){
+        #endif
+            if(volMod < 0 ){  *OCRnA[tt] = *OCRnB[tt] = buffer[whichBuff][buffCount] >> (volMod*-1);
+            }else{            *OCRnA[tt] = *OCRnB[tt] = buffer[whichBuff][buffCount] << volMod;
+            }
+            ++buffCount;
+
+        #if defined (STEREO_OR_16BIT)
+        }else{
+            if(bitRead(optionByte,1)){
+                buffer[whichBuff][buffCount] += 127;
+                //buffer[whichBuff][buffCount+1] += 127;
+            }
+            #if !defined (MODE2)
+                if(volMod < 0 ){ *OCRnA[tt] = buffer[whichBuff][buffCount] >> (volMod*-1);
+                                *OCRnB[tt] = buffer[whichBuff][buffCount+1] >> (volMod*-1);
+
+                }else{           *OCRnA[tt] = buffer[whichBuff][buffCount] << volMod;
+                                *OCRnB[tt] = buffer[whichBuff][buffCount+1] << volMod;
+                }
+            #else
+                if(volMod < 0 ){
+                                *OCRnA[tt] = *OCRnB[tt] = buffer[whichBuff][buffCount] >> (volMod*-1);
+                                *OCRnA[tt2] = *OCRnB[tt2] =buffer[whichBuff][buffCount+1] >> (volMod*-1);
+
+                }else{           *OCRnA[tt] = *OCRnB[tt] = buffer[whichBuff][buffCount] << volMod;
+                                *OCRnA[tt2] = *OCRnB[tt2] = buffer[whichBuff][buffCount+1] << volMod;
+                }
+
+            #endif
+            buffCount+=2;
+        }
+        #endif
+    
+#if defined (ENABLE_RECORDING)
+    }
+#endif
 
     if(buffCount >= buffSize){
       buffCount = 0;
@@ -726,7 +750,7 @@ ISR(TIMER1_OVF_vect){
 
 void TMRpcm::disable(){
     playing = 0;
-    *TIMSK[tt] &= ~( togByte | _BV(TOIE1) );
+    *TIMSK[tt] &= ~( SD_ISR_IE | SAMPLE_ISR_IE );
     if(ifOpen()){ sFile.close();}
     if(bitRead(*TCCRnA[tt],7) > 0){
         int current = *OCRnA[tt];
@@ -888,13 +912,13 @@ void TMRpcm::play(char* filename, unsigned long seekPoint, boolean which){
 
         noInterrupts();
         timerSt();
-        *TIMSK[tt] = ( togByte | _BV(TOIE1) );
+        *TIMSK[tt] = ( SD_ISR_IE | SAMPLE_ISR_IE );
         interrupts();
     }
     else
     {
         if(seekPoint > 0){ seekPoint = SAMPLE_RATE*seekPoint;}
-        *TIMSK[tt] &= ~togByte;
+        *TIMSK[tt] &= ~(SD_ISR_IE);
         if(!which){
             if(ifOpen()){ sFile.close(); }
 
@@ -937,7 +961,7 @@ void TMRpcm::play(char* filename, unsigned long seekPoint, boolean which){
                 return;
             } //open1 = 1; fileName2 = filename;  }
         }
-        *TIMSK[tt] |= togByte;
+        *TIMSK[tt] |= SD_ISR_IE;
         //interrupts();
     }
 }
@@ -1042,61 +1066,145 @@ volatile boolean clear = 0;
 
 
 #if !defined (USE_TIMER2)
-ISR(TIMER1_CAPT_vect){
+ISR(TIMER1_OVF_vect){
 #else
-ISR(TIMER2_COMPB_vect){
+ISR(TIMER2_OVF_vect){
 #endif
-    //if(playing || playing2){
+    // This is the lower priority ISR, which can be interrupted by a higher-priority ISR
+    // The first step is to disable this interrupt before manually enabling global interrupts.
+    // This allows this interrupt vector to continue loading data while allowing the other interrupt
+    // to interrupt it. ( Nested Interrupts )
+    // Then enable global interupts before this interrupt is finished, so the music can interrupt the buffering
 
-    b = !whichBuff2; a = !whichBuff;
-    if(buffWaiting[a] || buffWaiting2[b]){
-        *TIMSK[tt] &= ~togByte;
-        sei();
+    // This ISR serves a dual purpose: read from SD (when playing) to fill playback buffers, or write to
+    // SD (when recording) to dump the filled record buffers to sd
 
-        if(buffWaiting[a] ){
+    a = !whichBuff;
 
-            if(sFile.read((byte*)buffer[a],buffSize) < buffSize){
-
-                #if !defined (SDFAT)
-                if(bitRead(optionByte,3)){ sFile.seek(44); *TIMSK[tt] |= togByte; return;}
-                if(sFile){sFile.close();}
-                #else
-                if(bitRead(optionByte,3)){ sFile.seekSet(44); *TIMSK[tt] |= togByte; return;}
-                if(sFile.isOpen()){sFile.close();}
-                #endif
-                playing = 0;
-            }
+#if defined (ENABLE_RECORDING)
+    if(recording) {
+        // only uses the A buffer for recording
+        a = !whichBuff;
+        if(buffWaiting[a]) {
+            *TIMSK[tt] &= ~SD_ISR_IE;
+            sei();
+            sFile.write((byte*)buffer[a], buffSize );
             buffWaiting[a] = 0;
-
+            *TIMSK[tt] |= SD_ISR_IE;
         }
-
-        if(buffWaiting2[b] ){
-            if(tFile.read((byte*)buffer2[b],buffSize) < buffSize){
-
-                #if !defined (SDFAT)
-                if(bitRead(optionByte,2)){ tFile.seek(44); *TIMSK[tt] |= togByte; return;}
-                if(tFile){tFile.close();}
-                #else
-                if(bitRead(optionByte,2)){ tFile.seekSet(44); *TIMSK[tt] |= togByte; return;}
-                if(tFile.isOpen()){tFile.close();}
-                #endif
-                playing2 = 0;
-            }
-            buffWaiting2[b] = 0;
-
-        }
-        if(!playing && !playing2){  *TIMSK[tt] &= ~( togByte | _BV(TOIE1) );}
-        else{   *TIMSK[tt] |= togByte;  }
+        return;
     }
+    else
+    {
+#endif
+        b = !whichBuff2; a = !whichBuff;
+        if(buffWaiting[a] || buffWaiting2[b]){
+            *TIMSK[tt] &= ~SD_ISR_IE;
+            sei();
+
+            if(buffWaiting[a] ){
+
+                if(sFile.read((byte*)buffer[a],buffSize) < buffSize){
+
+                    // bug here - looping codepath doesn't actually mark this buffer for playback
+                    // so the last piece of the file won't get played before beginning again
+
+                    // another bug here - the non-looping codepath will playback the last buffer
+                    // but will also playback some portion of junk from the previous buffer
+                    // (including an entire buffer of junk if zero bytes were actually read at the end-of-file)
+
+                    if(bitRead(optionByte,3)){
+                        // restart from beginning (looping)
+                        #if !defined (SDFAT)
+                            sFile.seek(44);
+                        #else
+                            sFile.seekSet(44);
+                        #endif
+                        *TIMSK[tt] |= SD_ISR_IE;
+                        return;
+                    }
+                    else
+                    {
+                        // no looping
+                        #if !defined (SDFAT)
+                            if(sFile){sFile.close();}
+                        #else
+                            if(sFile.isOpen()){sFile.close();}
+                        #endif
+                        playing = 0;
+                    }
+                }
+                buffWaiting[a] = 0;
+            }
+
+            if(buffWaiting2[b] ){
+                if(tFile.read((byte*)buffer2[b],buffSize) < buffSize){
+
+                    // bug here - looping codepath doesn't actually mark this buffer for playback
+                    // so the last piece of the file won't get played before beginning again
+
+                    // another bug here - the non-looping codepath will playback the last buffer
+                    // but will also playback some portion of junk from the previous buffer
+                    // (including an entire buffer of junk if zero bytes were actually read at the end-of-file)
+
+                    if(bitRead(optionByte,2))
+                        // restart from beginning (looping)
+                        #if !defined (SDFAT)
+                            tFile.seek(44);
+                        #else
+                            tFile.seekSet(44);
+                        #endif
+                        *TIMSK[tt] |= SD_ISR_IE;
+                        return;
+                    }
+                    else
+                    {
+                        // no looping
+                        #if !defined (SDFAT)
+                            if(tFile){tFile.close();}
+                        #else
+                            if(tFile.isOpen()){tFile.close();}
+                        #endif
+                        playing2 = 0;
+                    }
+                }
+
+                buffWaiting2[b] = 0;
+
+            }
+
+            if(!playing && !playing2) {
+                // stop playback by stopping both the SD isr and the sample isr
+                // note that this might mean there is some 'unplayed' bits at the end
+                // of the buffers that just won't be played (another bug)
+                *TIMSK[tt] &= ~( SD_ISR_IE | SAMPLE_ISR_IE);
+            }
+            else
+            {
+                // re-enable the sd buffer interrupts
+                *TIMSK[tt] |= SD_ISR_IE;
+            }
+        }
+
+    #if defined (ENABLE_RECORDING)
+    }
+    #endif
 }
 
 
 #if !defined (USE_TIMER2)
-ISR(TIMER1_OVF_vect){
-if(bitRead(optionByte,6)){ loadCounter = !loadCounter;if(loadCounter){ return; }}
+ISR(TIMER1_CAPT_vect){
+    // This is the higher-priority ISR
+    // Servicing this is more important than SD operations
+    if(bitRead(optionByte,6)){
+        loadCounter = !loadCounter;
+        if(loadCounter){ return; }
+    }
 #else
 
-ISR(TIMER2_OVF_vect){
+ISR(TIMER2_COMPB_vect){
+    // This is the higher-priority ISR
+    // Servicing this is more important than SD operations
     switch (SR){
         case 0: if( loadCounter > 0 ){  if( loadCounter >= 3 ){loadCounter=0; return;} loadCounter++; return;} break;
         case 1: if(loadCounter > 0){ if(loadCounter >= 2){loadCounter=0; return; }loadCounter++;  return;} break;
@@ -1105,119 +1213,128 @@ ISR(TIMER2_OVF_vect){
     loadCounter++;
 #endif
 
-    if(playing){
+    // This is the higher-priority ISR
+    // Servicing this is more important than SD operations
 
-       if(!bitRead(optionByte,4)){
-
-        if(volMod < 0 ){
-              #if !defined (MODE2)
-              *OCRnA[tt] = buffer[whichBuff][buffCount] >> (volMod*-1);
-              #else
-              *OCRnA[tt] = *OCRnB[tt] = buffer[whichBuff][buffCount] >> (volMod*-1);
-              #endif
-        }else{
-              #if !defined (MODE2)
-              *OCRnA[tt] = buffer[whichBuff][buffCount] << volMod;
-              #else
-              *OCRnA[tt] = *OCRnB[tt] = buffer[whichBuff][buffCount] << volMod;
-              #endif
+#if defined (ENABLE_RECORDING)
+    if(recording) {
+        buffer[whichBuff][buffCount] = ADCH;
+        if(recording > 1){
+            if(volMod < 0 ){  *OCRnA[tt] = ADCH >> (volMod*-1);
+            }else{            *OCRnA[tt] = ADCH << volMod;
+            }
         }
-        buffCount++;
+        ++buffCount;
         if(buffCount >= buffSize){
             buffCount = 0;
             buffWaiting[whichBuff] = true;
             whichBuff = !whichBuff;
         }
-      }else{//STEREO
-
-        if(volMod < 0 ){
-              #if !defined (MODE2)
-              *OCRnA[tt] = buffer[whichBuff][buffCount] >> (volMod*-1);
-              *OCRnB[tt] = buffer[whichBuff][buffCount+1] >> (volMod*-1);
-              #else
-              *OCRnA[tt] = buffer[whichBuff][buffCount] >> (volMod*-1);
-              *OCRnB[tt] = buffer[whichBuff][buffCount+1] >> (volMod*-1);
-              #endif
-        }else{
-              #if !defined (MODE2)
-              *OCRnA[tt] = buffer[whichBuff][buffCount] << volMod;
-              *OCRnB[tt] = buffer[whichBuff][buffCount+1] << volMod;
-              #else
-              *OCRnA[tt] = buffer[whichBuff][buffCount] << volMod;
-              *OCRnB[tt] = buffer[whichBuff][buffCount+1] << volMod;
-              #endif
-
-        }
-        buffCount+=2;
-        if(buffCount >= buffSize){
-            buffCount = 0;
-            buffWaiting[whichBuff] = true;
-            whichBuff = !whichBuff;
-        }
-      }
-
     }
+    else
+    {
+#endif
+        if(playing){
+            if(!bitRead(optionByte,4)){
 
+                if(volMod < 0 ){
+                    #if !defined (MODE2)
+                    *OCRnA[tt] = buffer[whichBuff][buffCount] >> (volMod*-1);
+                    #else
+                    *OCRnA[tt] = *OCRnB[tt] = buffer[whichBuff][buffCount] >> (volMod*-1);
+                    #endif
+                }else{
+                    #if !defined (MODE2)
+                    *OCRnA[tt] = buffer[whichBuff][buffCount] << volMod;
+                    #else
+                    *OCRnA[tt] = *OCRnB[tt] = buffer[whichBuff][buffCount] << volMod;
+                    #endif
+                }
+                buffCount++;
+            }else{//STEREO
 
+                if(volMod < 0 ){
+                    #if !defined (MODE2)
+                    *OCRnA[tt] = buffer[whichBuff][buffCount] >> (volMod*-1);
+                    *OCRnB[tt] = buffer[whichBuff][buffCount+1] >> (volMod*-1);
+                    #else
+                    *OCRnA[tt] = buffer[whichBuff][buffCount] >> (volMod*-1);
+                    *OCRnB[tt] = buffer[whichBuff][buffCount+1] >> (volMod*-1);
+                    #endif
+                }else{
+                    #if !defined (MODE2)
+                    *OCRnA[tt] = buffer[whichBuff][buffCount] << volMod;
+                    *OCRnB[tt] = buffer[whichBuff][buffCount+1] << volMod;
+                    #else
+                    *OCRnA[tt] = buffer[whichBuff][buffCount] << volMod;
+                    *OCRnB[tt] = buffer[whichBuff][buffCount+1] << volMod;
+                    #endif
 
-    if(playing2){
-        if(!bitRead(optionByte,4)){
-            if(volMod < 0 ){
-                #if !defined (MODE2)
-                *OCRnB[tt] = buffer2[whichBuff2][buffCount2] >> (volMod*-1);
-                #else
-                *OCRnA[tt2] = *OCRnB[tt2] = buffer2[whichBuff2][buffCount2] >> (volMod*-1);
-                #endif
-            }else{
-                #if !defined (MODE2)
-                *OCRnB[tt] = buffer2[whichBuff2][buffCount2] << volMod;
-                #else
-                *OCRnA[tt2] = *OCRnB[tt2] = buffer2[whichBuff2][buffCount2] << volMod;
-                #endif
+                }
+                buffCount+=2;
             }
-            buffCount2++;
+            if(buffCount >= buffSize){
+                buffCount = 0;
+                buffWaiting[whichBuff] = true;
+                whichBuff = !whichBuff;
+            }
+        }
+
+        if(playing2){
+            if(!bitRead(optionByte,4)){
+                if(volMod < 0 ){
+                    #if !defined (MODE2)
+                    *OCRnB[tt] = buffer2[whichBuff2][buffCount2] >> (volMod*-1);
+                    #else
+                    *OCRnA[tt2] = *OCRnB[tt2] = buffer2[whichBuff2][buffCount2] >> (volMod*-1);
+                    #endif
+                }else{
+                    #if !defined (MODE2)
+                    *OCRnB[tt] = buffer2[whichBuff2][buffCount2] << volMod;
+                    #else
+                    *OCRnA[tt2] = *OCRnB[tt2] = buffer2[whichBuff2][buffCount2] << volMod;
+                    #endif
+                }
+                buffCount2++;
+            }else{//STEREO
+
+                if(volMod < 0 ){
+                    #if !defined (MODE2)
+                    *OCRnB[tt] = buffer2[whichBuff2][buffCount2] >> (volMod*-1);
+                    *OCRnA[tt] = buffer2[whichBuff2][buffCount2+1] >> (volMod*-1);
+                    #else
+                    *OCRnA[tt2] = buffer2[whichBuff2][buffCount2] >> (volMod*-1);
+                    *OCRnB[tt2] = buffer2[whichBuff2][buffCount2+1] >> (volMod*-1);
+                    #endif
+                }else{
+                    #if !defined (MODE2)
+                    *OCRnB[tt] = buffer2[whichBuff2][buffCount2] << volMod;
+                    *OCRnA[tt] = buffer2[whichBuff2][buffCount2+1] << volMod;
+                    #else
+                    *OCRnA[tt2] = buffer2[whichBuff2][buffCount2] << volMod;
+                    *OCRnB[tt2] = buffer2[whichBuff2][buffCount2+1] << volMod;
+                    #endif
+                }
+                buffCount2 += 2;
+            }
             if(buffCount2 >= buffSize){
                 buffCount2 = 0;
                 buffWaiting2[whichBuff2] = true;
                 whichBuff2 = !whichBuff2;
             }
-
-
-        }else{
-            if(volMod < 0 ){
-                #if !defined (MODE2)
-                *OCRnB[tt] = buffer2[whichBuff2][buffCount2] >> (volMod*-1);
-                *OCRnA[tt] = buffer2[whichBuff2][buffCount2+1] >> (volMod*-1);
-                #else
-                *OCRnA[tt2] = buffer2[whichBuff2][buffCount2] >> (volMod*-1);
-                *OCRnB[tt2] = buffer2[whichBuff2][buffCount2+1] >> (volMod*-1);
-                #endif
-            }else{
-                #if !defined (MODE2)
-                *OCRnB[tt] = buffer2[whichBuff2][buffCount2] << volMod;
-                *OCRnA[tt] = buffer2[whichBuff2][buffCount2+1] << volMod;
-                #else
-                *OCRnA[tt2] = buffer2[whichBuff2][buffCount2] << volMod;
-                *OCRnB[tt2] = buffer2[whichBuff2][buffCount2+1] << volMod;
-                #endif
-            }
-            buffCount2 += 2;
-            if(buffCount2 >= buffSize){
-                buffCount2 = 0;
-                buffWaiting2[whichBuff2] = true;
-                whichBuff2 = !whichBuff2;
-            }
-
-
         }
+#if defined (ENABLE_RECORDING)
     }
+#endif
 
 }
 
 
 void TMRpcm::stopPlayback(boolean which){
+    // bug?  shouldn't the interrupt-enable flags be cleared at the end of this function
+    // (after setting playing=0 and playing2=0 accordingly?))
     if(!playing && !playing2){
-        *TIMSK[tt] &= ~( togByte | _BV(TOIE1) );
+        *TIMSK[tt] &= ~( SD_ISR_IE | SAMPLE_ISR_IE );
     }
     if(!which){
         playing = 0;
@@ -1234,7 +1351,7 @@ void TMRpcm::stopPlayback(boolean which){
 
 void TMRpcm::disable(){
     playing = 0; playing2 = 0;
-    *TIMSK[tt] &= ~( togByte | _BV(TOIE1) );
+    *TIMSK[tt] &= ~( SD_ISR_IE | SAMPLE_ISR_IE );
     if(ifOpen()){sFile.close(); }
         #if !defined (SDFAT)
             if(tFile){tFile.close();}
@@ -1763,23 +1880,20 @@ void TMRpcm::startRecording(char *fileName, unsigned int SAMPLE_RATE, byte pin, 
 
     //Set up the timer
     if(recording > 1){
-
         *TCCRnA[tt] = _BV(COM1A1); //Enable the timer port/pin as output for passthrough
-
     }
     *ICRn[tt] = 10 * (RESOLUTION_BASE/SAMPLE_RATE);//Timer will count up to this value from 0;
     *TCCRnA[tt] |= _BV(WGM11); //WGM11,12,13 all set to 1 = fast PWM/w ICR TOP
     *TCCRnB[tt] = _BV(WGM13) | _BV(WGM12) | _BV(CS10); //CS10 = no prescaling
 
     if(recording < 3){ //Normal Recording
-        *TIMSK[tt] |=  _BV(OCIE1B)| _BV(OCIE1A); //Enable the TIMER1 COMPA and COMPB interrupts
+        *TIMSK[tt] |= SD_ISR_IE | SAMPLE_ISR_IE; //Enable the interrupts for sampleing and writing to SD
     }else{
-        *TIMSK[tt] |=  _BV(OCIE1B); //Direct pass through to speaker, COMPB only
+        *TIMSK[tt] |= SAMPLE_ISR_IE; //Direct pass through to speaker, so keep the SD interrupt disabled
     }
 
-
     ADMUX |= _BV(REFS0) | _BV(ADLAR);// Analog 5v reference, left-shift result so only high byte needs to be read
-    ADCSRB |= _BV(ADTS0) | _BV(ADTS2);  //Attach ADC start to TIMER1 Compare Match B flag
+    ADCSRB |= _BV(ADTS0) | _BV(ADTS1) | _BV(ADTS2);  //Attach ADC start to TIMER1 CAPTURE flag
     byte prescaleByte = 0;
 
     if(      SAMPLE_RATE < 18000){ prescaleByte = B00000110;} //ADC division factor 64 (16MHz / 64 / 13clock cycles = 19230 Hz Max Sample Rate )
@@ -1800,7 +1914,7 @@ void TMRpcm::stopRecording(const __FlashStringHelper* FS){
 
 void TMRpcm::stopRecording(char *fileName){
 
-    *TIMSK[tt] &= ~(_BV(OCIE1B) | _BV(OCIE1A));
+    *TIMSK[tt] &= ~(SD_ISR_IE | SAMPLE_ISR_IE);
     ADCSRA = 0;
     ADCSRB = 0;
 
