@@ -685,10 +685,14 @@ ISR(TIMER1_CAPT_vect){
 
 #if defined (ENABLE_RECORDING)
     if(recording) {
-        buffer[whichBuff][buffCount] = ADCH;
+        byte val;
+        while(!(ADCSRA&(_BV(ADIF)))) {};
+        ADCSRA &= ~(_BV(ADIF));
+        val = ADCH;
+        buffer[whichBuff][buffCount] = val;
         if(recording > 1){
-            if(volMod < 0 ){  *OCRnA[tt] = ADCH >> (volMod*-1);
-            }else{            *OCRnA[tt] = ADCH << volMod;
+            if(volMod < 0 ){  *OCRnA[tt] = val >> (volMod*-1);
+            }else{            *OCRnA[tt] = val << volMod;
             }
         }
         ++buffCount;
@@ -1873,26 +1877,19 @@ void TMRpcm::startRecording(char *fileName, unsigned int SAMPLE_RATE, byte pin, 
         // 0 to 7 (MUX5 low) or 8 to 15 (MUX5 high).
         ADCSRB = (ADCSRB & ~(1 << MUX5)) | (((pin >> 3) & 0x01) << MUX5);
     #endif
-
-    #if defined(ADMUX)
-        ADMUX = (pin & 0x07);
-    #endif
+    ADMUX = (pin & 0x07);
+    ADMUX |= _BV(REFS0) | _BV(ADLAR);// Analog 5v reference, left-shift result so only high byte needs to be read
 
     //Set up the timer
     if(recording > 1){
         *TCCRnA[tt] = _BV(COM1A1); //Enable the timer port/pin as output for passthrough
+    }else{
+        *TCCRnA[tt] = 0;
     }
     *ICRn[tt] = 10 * (RESOLUTION_BASE/SAMPLE_RATE);//Timer will count up to this value from 0;
     *TCCRnA[tt] |= _BV(WGM11); //WGM11,12,13 all set to 1 = fast PWM/w ICR TOP
     *TCCRnB[tt] = _BV(WGM13) | _BV(WGM12) | _BV(CS10); //CS10 = no prescaling
 
-    if(recording < 3){ //Normal Recording
-        *TIMSK[tt] |= SD_ISR_IE | SAMPLE_ISR_IE; //Enable the interrupts for sampleing and writing to SD
-    }else{
-        *TIMSK[tt] |= SAMPLE_ISR_IE; //Direct pass through to speaker, so keep the SD interrupt disabled
-    }
-
-    ADMUX |= _BV(REFS0) | _BV(ADLAR);// Analog 5v reference, left-shift result so only high byte needs to be read
     ADCSRB |= _BV(ADTS0) | _BV(ADTS1) | _BV(ADTS2);  //Attach ADC start to TIMER1 CAPTURE flag
     byte prescaleByte = 0;
 
@@ -1902,7 +1899,12 @@ void TMRpcm::startRecording(char *fileName, unsigned int SAMPLE_RATE, byte pin, 
     ADCSRA = prescaleByte; //Adjust sampling rate of ADC depending on sample rate
     ADCSRA |= _BV(ADEN) | _BV(ADATE); //ADC Enable, Auto-trigger enable
 
-
+    // finally, enable timer interrupts
+    if(recording < 3){ //Normal Recording
+        *TIMSK[tt] |= SD_ISR_IE | SAMPLE_ISR_IE; //Enable the interrupts for sampleing and writing to SD
+    }else{
+        *TIMSK[tt] |= SAMPLE_ISR_IE; //Direct pass through to speaker, so keep the SD interrupt disabled
+    }
 }
 
 void TMRpcm::stopRecording(const __FlashStringHelper* FS){
